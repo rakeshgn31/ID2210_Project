@@ -17,13 +17,15 @@
  */
 package se.kth.news.core.news;
 
+import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.Map;
+import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import se.kth.news.core.leader.LeaderSelectPort;
 import se.kth.news.core.leader.LeaderUpdate;
 import se.kth.news.core.news.util.NewsView;
+import se.kth.news.play.NewsItem;
 import se.kth.news.play.Ping;
 import se.kth.news.play.Pong;
 import se.sics.kompics.ClassMatchedHandler;
@@ -34,6 +36,9 @@ import se.sics.kompics.Positive;
 import se.sics.kompics.Start;
 import se.sics.kompics.network.Network;
 import se.sics.kompics.network.Transport;
+import se.sics.kompics.timer.CancelPeriodicTimeout;
+import se.sics.kompics.timer.SchedulePeriodicTimeout;
+import se.sics.kompics.timer.Timeout;
 import se.sics.kompics.timer.Timer;
 import se.sics.ktoolbox.croupier.CroupierPort;
 import se.sics.ktoolbox.croupier.event.CroupierSample;
@@ -67,6 +72,10 @@ public class NewsComp extends ComponentDefinition {
     private KAddress selfAdr;
     private Identifier gradientOId;
     //*******************************INTERNAL_STATE*****************************
+    private UUID m_nTimeoutID;
+    private int nNewsSeqCounter;
+    private CroupierSample<NewsView> croupNeighborView;
+    private ArrayList<String> arrReceivedNews;
     private NewsView localNewsView;
 
     public NewsComp(Init init) {
@@ -75,10 +84,17 @@ public class NewsComp extends ComponentDefinition {
         LOG.info("{}initiating...", logPrefix);
 
         gradientOId = init.gradientOId;
+        croupNeighborView = null;
+        nNewsSeqCounter = 0;
+        arrReceivedNews = new ArrayList<>();
 
         subscribe(handleStart, control);
         subscribe(handleCroupierSample, croupierPort);
         subscribe(handleGradientSample, gradientPort);
+        
+        // Task - 1 related events
+        subscribe(handleNewsItem, networkPort);
+        subscribe(handleNewsFloodTimeout, timerPort);
         subscribe(handleLeader, leaderPort);
         subscribe(handlePing, networkPort);
         subscribe(handlePong, networkPort);
@@ -88,12 +104,25 @@ public class NewsComp extends ComponentDefinition {
         @Override
         public void handle(Start event) {
             LOG.info("{}starting...", logPrefix);
-            updateLocalNewsView();
+            updateLocalNewsView(0);
+            
+            // Schedule a timeout for the news flood and initial topology stabilization
+            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 2000);
+            NewsFloodTimeout floodTO = new NewsFloodTimeout(spt);
+            spt.setTimeoutEvent(floodTO);
+            trigger(spt, timerPort);
+            m_nTimeoutID = floodTO.getTimeoutId();
         }
     };
 
-    private void updateLocalNewsView() {
-        localNewsView = new NewsView(selfAdr.getId(), 0);
+    @Override
+    public void tearDown() {
+        trigger(new CancelPeriodicTimeout(m_nTimeoutID), timerPort);
+    }
+    
+    private void updateLocalNewsView(int nCount) {
+        
+        localNewsView = new NewsView(selfAdr.getId(), nCount);
         LOG.debug("{}informing overlays of new view", logPrefix);
         trigger(new OverlayViewUpdate.Indication<>(gradientOId, false, localNewsView.copy()), viewUpdatePort);
     }
@@ -105,16 +134,87 @@ public class NewsComp extends ComponentDefinition {
                 return;
             }
             
-            Iterator<Identifier> it = castSample.publicSample.keySet().iterator();
-            KAddress partner = castSample.publicSample.get(it.next()).getSource();
-            KHeader header = new BasicHeader(selfAdr, partner, Transport.UDP);
-            KContentMsg msg = new BasicContentMsg(header, new Ping());
-            trigger(msg, networkPort);
+            croupNeighborView = castSample;
         }
     };
 
-    Handler handleNewsFlood 
-            
+    Handler handleNewsFloodTimeout = new Handler<NewsFloodTimeout>() {
+        @Override
+        public void handle(NewsFloodTimeout event) {
+         
+            // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
+            int nNodeID = Integer.parseInt( selfAdr.getIp().toString().split(".")[3] );
+            if(nNodeID % 3 == 0) {
+                generateNews();
+            }
+        } 
+    }; 
+    
+    ClassMatchedHandler handleNewsItem = new 
+            ClassMatchedHandler<NewsItem, KContentMsg<?, ?, NewsItem>>() {
+        @Override
+        public void handle(NewsItem newsItem, KContentMsg<?, ?, NewsItem> container) {
+            String strNews = newsItem.getNewsItem();
+            int nTTL = newsItem.getTTLValue();
+            // Check if the news is not already received
+            if( !arrReceivedNews.contains(strNews) ) {
+                arrReceivedNews.add(strNews);
+                updateLocalNewsView(arrReceivedNews.size());    // Update regarding receiving new news item 
+                nTTL--;
+                if(nTTL > 0) {
+                    NewsItem news = new NewsItem(nTTL, strNews);
+                    floodNewsToNeighbors(container.getHeader().getSource(), news);
+                }
+            }
+        }    
+    };
+ 
+    private void generateNews() {
+        
+        CroupierSample<NewsView> tempView = croupNeighborView;
+        if(tempView != null) {
+            if( !tempView.publicSample.isEmpty() ) {
+                
+                // Generate the new News Item
+                nNewsSeqCounter++;
+                String strNews = selfAdr.getIp().toString() + "_" + nNewsSeqCounter 
+                                                            + "_" + "Hai...I have the file";
+                NewsItem news = new NewsItem(5, strNews);
+                arrReceivedNews.add(strNews);                   // Add news to its own received set
+                updateLocalNewsView(arrReceivedNews.size());    // Update its own local view
+                
+                // Distribute to its neighbors
+                Iterator<Identifier> iter = tempView.publicSample.keySet().iterator();
+                while(iter.hasNext()) {
+                    KAddress neighbor = tempView.publicSample.get(iter.next()).getSource();
+                    KHeader header = new BasicHeader(selfAdr, neighbor, Transport.UDP);
+                    KContentMsg msg = new BasicContentMsg(header, news);
+                    trigger(msg, networkPort);
+                }                                
+            }
+        }        
+    }
+    
+    private void floodNewsToNeighbors(KAddress srcAddress, NewsItem newsItem) {
+
+        CroupierSample<NewsView> tempView = croupNeighborView;
+        if(tempView != null) {
+            if( !tempView.publicSample.isEmpty() ) {
+                
+                // Distribute to its neighbors
+                Iterator<Identifier> iter = tempView.publicSample.keySet().iterator();
+                while(iter.hasNext()) {
+                    KAddress neighbor = tempView.publicSample.get(iter.next()).getSource();
+                    if( !neighbor.getId().equals(srcAddress.getId()) ) {
+                        KHeader header = new BasicHeader(selfAdr, neighbor, Transport.UDP);
+                        KContentMsg msg = new BasicContentMsg(header, newsItem);
+                        trigger(msg, networkPort);
+                    }
+                }
+            }
+        }          
+    }
+        
     Handler handleGradientSample = new Handler<TGradientSample>() {
         @Override
         public void handle(TGradientSample sample) {
@@ -127,6 +227,13 @@ public class NewsComp extends ComponentDefinition {
         }
     };
 
+    public static class NewsFloodTimeout extends Timeout {
+
+        public NewsFloodTimeout(SchedulePeriodicTimeout spt) {
+            super(spt);
+        }
+    }    
+    
     ClassMatchedHandler handlePing
             = new ClassMatchedHandler<Ping, KContentMsg<?, ?, Ping>>() {
 
@@ -145,7 +252,7 @@ public class NewsComp extends ComponentDefinition {
                     LOG.info("{}received pong from:{}", logPrefix, container.getHeader().getSource());
                 }
             };
-
+        
     public static class Init extends se.sics.kompics.Init<NewsComp> {
 
         public final KAddress selfAdr;
