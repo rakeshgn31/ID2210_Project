@@ -140,14 +140,14 @@ public class ScenarioGen {
                 StochasticProcess startPeers = new StochasticProcess() {
                     {
                         eventInterArrivalTime(uniform(1000, 1100));
-                        raise(5, startNodeOp, new BasicIntSequentialDistribution(1));
+                        raise(10, startNodeOp, new BasicIntSequentialDistribution(1));
                     }
                 };
 
                 systemSetup.start();
                 startBootstrapServer.startAfterTerminationOf(1000, systemSetup);
                 startPeers.startAfterTerminationOf(1000, startBootstrapServer);
-                terminateAfterTerminationOf(1000*1000, startPeers);
+                terminateAfterTerminationOf(180000, startPeers);
             }
         };
 

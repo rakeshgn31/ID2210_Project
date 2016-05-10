@@ -96,8 +96,9 @@ public class NewsComp extends ComponentDefinition {
         subscribe(handleNewsItem, networkPort);
         subscribe(handleNewsFloodTimeout, timerPort);
         subscribe(handleLeader, leaderPort);
-        subscribe(handlePing, networkPort);
-        subscribe(handlePong, networkPort);
+        
+        // subscribe(handlePing, networkPort);
+        // subscribe(handlePong, networkPort);
     }
 
     Handler handleStart = new Handler<Start>() {
@@ -107,7 +108,7 @@ public class NewsComp extends ComponentDefinition {
             updateLocalNewsView(0);
             
             // Schedule a timeout for the news flood and initial topology stabilization
-            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 2000);
+            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 5000);
             NewsFloodTimeout floodTO = new NewsFloodTimeout(spt);
             spt.setTimeoutEvent(floodTO);
             trigger(spt, timerPort);
@@ -143,7 +144,7 @@ public class NewsComp extends ComponentDefinition {
         public void handle(NewsFloodTimeout event) {
          
             // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
-            int nNodeID = Integer.parseInt( selfAdr.getIp().toString().split(".")[3] );
+            int nNodeID = Integer.parseInt( selfAdr.getIp().toString().split("\\.")[3] );
             if(nNodeID % 3 == 0) {
                 generateNews();
             }
@@ -159,6 +160,7 @@ public class NewsComp extends ComponentDefinition {
             // Check if the news is not already received
             if( !arrReceivedNews.contains(strNews) ) {
                 arrReceivedNews.add(strNews);
+                LOG.info(selfAdr.getIp().toString() + " received news item : " + strNews);
                 updateLocalNewsView(arrReceivedNews.size());    // Update regarding receiving new news item 
                 nTTL--;
                 if(nTTL > 0) {
@@ -170,7 +172,7 @@ public class NewsComp extends ComponentDefinition {
     };
  
     private void generateNews() {
-        
+
         CroupierSample<NewsView> tempView = croupNeighborView;
         if(tempView != null) {
             if( !tempView.publicSample.isEmpty() ) {
@@ -180,8 +182,7 @@ public class NewsComp extends ComponentDefinition {
                 String strNews = selfAdr.getIp().toString() + "_" + nNewsSeqCounter 
                                                             + "_" + "Hai...I have the file";
                 NewsItem news = new NewsItem(5, strNews);
-                arrReceivedNews.add(strNews);                   // Add news to its own received set
-                updateLocalNewsView(arrReceivedNews.size());    // Update its own local view
+                arrReceivedNews.add(strNews);                   // Add news to its own received set                
                 
                 // Distribute to its neighbors
                 Iterator<Identifier> iter = tempView.publicSample.keySet().iterator();
@@ -190,7 +191,9 @@ public class NewsComp extends ComponentDefinition {
                     KHeader header = new BasicHeader(selfAdr, neighbor, Transport.UDP);
                     KContentMsg msg = new BasicContentMsg(header, news);
                     trigger(msg, networkPort);
-                }                                
+                }
+
+                updateLocalNewsView(arrReceivedNews.size());    // Update the overlay of the new news view                
             }
         }        
     }

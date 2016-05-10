@@ -82,6 +82,9 @@ public class LeaderSelectComp extends ComponentDefinition {
 
         subscribe(handleStart, control);
         subscribe(handleGradientSample, gradientPort);
+        subscribe(handleLETimeout, timerPort);
+        subscribe(handleLENomineeReq, networkPort);
+        subscribe(handleLENominationResp, networkPort);
     }
 
     Handler handleStart = new Handler<Start>() {
