@@ -108,7 +108,7 @@ public class NewsComp extends ComponentDefinition {
             updateLocalNewsView(0);
             
             // Schedule a timeout for the news flood and initial topology stabilization
-            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 5000);
+            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 30000);
             NewsFloodTimeout floodTO = new NewsFloodTimeout(spt);
             spt.setTimeoutEvent(floodTO);
             trigger(spt, timerPort);
@@ -145,7 +145,7 @@ public class NewsComp extends ComponentDefinition {
          
             // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
             int nNodeID = Integer.parseInt( selfAdr.getIp().toString().split("\\.")[3] );
-            if(nNodeID % 3 == 0) {
+            if(nNodeID % 15 == 0) {
                 generateNews();
             }
         } 
