@@ -50,6 +50,7 @@ import se.sics.ktoolbox.util.network.KContentMsg;
 import se.sics.ktoolbox.util.network.KHeader;
 import se.sics.ktoolbox.util.network.basic.BasicContentMsg;
 import se.sics.ktoolbox.util.network.basic.BasicHeader;
+import se.sics.ktoolbox.util.other.Container;
 import se.sics.ktoolbox.util.overlays.view.OverlayViewUpdate;
 import se.sics.ktoolbox.util.overlays.view.OverlayViewUpdatePort;
 
@@ -77,6 +78,10 @@ public class NewsComp extends ComponentDefinition {
     private CroupierSample<NewsView> croupNeighborView;
     private ArrayList<String> arrReceivedNews;
     private NewsView localNewsView;
+    
+    // Leader is elected for the first time stop the news flooding
+    private KAddress m_addrLeader;
+    private TGradientSample<NewsView> gradSample;
 
     public NewsComp(Init init) {
         selfAdr = init.selfAdr;
@@ -88,6 +93,8 @@ public class NewsComp extends ComponentDefinition {
         nNewsSeqCounter = 0;
         arrReceivedNews = new ArrayList<>();
 
+        m_addrLeader = null;
+        
         subscribe(handleStart, control);
         subscribe(handleCroupierSample, croupierPort);
         subscribe(handleGradientSample, gradientPort);
@@ -108,7 +115,7 @@ public class NewsComp extends ComponentDefinition {
             updateLocalNewsView(0);
             
             // Schedule a timeout for the news flood and initial topology stabilization
-            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 30000);
+            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(60000, 5000);
             NewsFloodTimeout floodTO = new NewsFloodTimeout(spt);
             spt.setTimeoutEvent(floodTO);
             trigger(spt, timerPort);
@@ -118,7 +125,9 @@ public class NewsComp extends ComponentDefinition {
 
     @Override
     public void tearDown() {
-        trigger(new CancelPeriodicTimeout(m_nTimeoutID), timerPort);
+        if(m_nTimeoutID != null) {
+            trigger(new CancelPeriodicTimeout(m_nTimeoutID), timerPort);
+        }
     }
     
     private void updateLocalNewsView(int nCount) {
@@ -143,10 +152,12 @@ public class NewsComp extends ComponentDefinition {
         @Override
         public void handle(NewsFloodTimeout event) {
          
-            // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
-            int nNodeID = Integer.parseInt( selfAdr.getIp().toString().split("\\.")[3] );
-            if(nNodeID % 15 == 0) {
-                generateNews();
+            if(m_addrLeader == null) {
+                // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
+                int nNodeID = Integer.parseInt( selfAdr.getIp().toString().split("\\.")[3] );
+                if(nNodeID % 15 == 0) {
+                    generateNews();                
+                }
             }
         } 
     }; 
@@ -221,6 +232,9 @@ public class NewsComp extends ComponentDefinition {
     Handler handleGradientSample = new Handler<TGradientSample>() {
         @Override
         public void handle(TGradientSample sample) {
+            
+            // Store it in for later usage
+            gradSample = sample;
         }
     };
 

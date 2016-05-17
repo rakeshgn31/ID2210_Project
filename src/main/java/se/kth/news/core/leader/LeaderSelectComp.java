@@ -33,6 +33,7 @@ import se.sics.kompics.network.Network;
 import se.sics.kompics.network.Transport;
 import se.sics.kompics.timer.CancelPeriodicTimeout;
 import se.sics.kompics.timer.SchedulePeriodicTimeout;
+import se.sics.kompics.timer.ScheduleTimeout;
 import se.sics.kompics.timer.Timeout;
 import se.sics.kompics.timer.Timer;
 import se.sics.ktoolbox.gradient.GradientPort;
@@ -106,16 +107,16 @@ public class LeaderSelectComp extends ComponentDefinition {
         public void handle(Start event) {
             LOG.info("{}starting...", logPrefix);
             
-            // Schedule a timeout for the leader election and initial topology stabilization
-            SchedulePeriodicTimeout spt = new SchedulePeriodicTimeout(0, 60000);
-            LETimeout leTO = new LETimeout(spt);
+            // Schedule a timeout so that the topology shall stabilize by then
+            ScheduleTimeout spt = new ScheduleTimeout(70000);
+            stabilizationTimeout leTO = new stabilizationTimeout(spt);
             spt.setTimeoutEvent(leTO);
             trigger(spt, timerPort);
             m_nLETimeoutID = leTO.getTimeoutId();  
             
             // Schedule a periodic timeout for getting to learn the leader
-            SchedulePeriodicTimeout spt1 = new SchedulePeriodicTimeout(0, 20000);
-            LUpdateTimeout luTO = new LUpdateTimeout(spt1);
+            SchedulePeriodicTimeout spt1 = new SchedulePeriodicTimeout(30000, 2000);
+            LeaderUpdateTimeout luTO = new LeaderUpdateTimeout(spt1);
             spt1.setTimeoutEvent(luTO);
             trigger(spt1, timerPort);
             m_nLUTimeoutID = luTO.getTimeoutId();
@@ -130,11 +131,7 @@ public class LeaderSelectComp extends ComponentDefinition {
     
     Handler handleGradientSample = new Handler<TGradientSample>() {
         @Override
-        public void handle(TGradientSample sample) {
-            LOG.debug("{}neighbours:{}", logPrefix, sample.gradientNeighbours);
-            LOG.debug("{}fingers:{}", logPrefix, sample.gradientFingers);
-            LOG.debug("{}local view:{}", logPrefix, sample.selfView);
-            
+        public void handle(TGradientSample sample) {            
             gradSample = sample;
         }
     };
@@ -142,66 +139,27 @@ public class LeaderSelectComp extends ComponentDefinition {
     // *************************************************************************
     //                      Leader Election Code
     // *************************************************************************
-    Handler handleLETimeout = new Handler<LETimeout>() {
+    Handler handleLETimeout = new Handler<stabilizationTimeout>() {
         @Override
-        public void handle(LETimeout event) {
-            if(m_addrLeader == null && !m_bIsLeaderAlive && gradSample != null) {
-                LOG.info(selfAdr.getIp().toString() + ": leader is empty so gonna conduct election");
-                // No leader is present, so conduct the leader election
-                int nCounter = 0;
-                tempGradSample = gradSample;
-                m_nNumOfACKsForLE = 0;
-                m_bLeaderDisseminated = false;
-                if(tempGradSample.gradientNeighbours.size() > 0) {
-                    Iterator<Container<KAddress, NewsView>> iter1 = 
-                                tempGradSample.gradientNeighbours.iterator();
-                    while(iter1.hasNext()) {
-                        if(viewComparator.compare(tempGradSample.selfView, iter1.next().getContent()) >= 0) {
-                           nCounter++;
-                        } 
-                    }
-                    
-                    // Utility value of the node is greater than its neighbor.
-                    // Hence, it triggers a Leader Nominee request to all its neighbors.
-                    if(nCounter == tempGradSample.gradientNeighbours.size()) {
-                        LOG.info(selfAdr.getIp().toString() + ": have more utility value - gonna ask my neighbors");
-                        Iterator<Container<KAddress, NewsView>> iter2 = tempGradSample.gradientNeighbours.iterator();
-                        while(iter2.hasNext()) {
-                            KAddress neighbor = iter2.next().getSource();
-                            KHeader header = new BasicHeader(selfAdr, neighbor, Transport.UDP);
-                            KContentMsg msg = new BasicContentMsg(header, new LeaderNomineeRequest(tempGradSample.selfView));
-                            trigger(msg, networkPort);
-                        } 
-                    }
-                }
-            }
+        public void handle(stabilizationTimeout event) {                        
         }        
     };
 
-        ClassMatchedHandler handleLENomineeReq = new 
-        ClassMatchedHandler<LeaderNomineeRequest, KContentMsg<?, ?, LeaderNomineeRequest>>() {
+    ClassMatchedHandler handleLENomineeReq = new 
+    ClassMatchedHandler<LeaderNomineeRequest, KContentMsg<?, ?, LeaderNomineeRequest>>() {
         @Override
         public void handle(LeaderNomineeRequest req, KContentMsg<?, ?, LeaderNomineeRequest> container) {
             if(gradSample != null) {
-                tempGradSample = gradSample;
-                int nSuccessfulComparisons = 0;
+                
                 boolean bSendACK = false;
-                // First compare to itself and proceed with comaparing to neighbors
-                if( viewComparator.compare(tempGradSample.selfView, req.m_nomineeNewsView) <= 0) {
+                if( viewComparator.compare(gradSample.selfView, req.m_nomineeNewsView) < 0) {
                     
-                    nSuccessfulComparisons++;   // For the successful comparison with received node's view
-                    Iterator<Container<KAddress, NewsView>> iter = tempGradSample.gradientNeighbours.iterator();
-                    while(iter.hasNext()) {
-                        if(viewComparator.compare(iter.next().getContent(), req.m_nomineeNewsView) <= 0) {
-                           nSuccessfulComparisons++;
-                        }
-                    }
-                    
-                    if(nSuccessfulComparisons == (tempGradSample.gradientNeighbours.size() + 1) ) {
+                    Container<KAddress, NewsView> highestNeighbor = getNodeWithHighestNewsview(true);
+                    if( viewComparator.compare(highestNeighbor.getContent(), req.m_nomineeNewsView) < 0) {
                         bSendACK = true;
                     }
                 }
-                
+              
                 // Finally send the acknowledgement
                 LOG.info(selfAdr.getIp().toString() + " sending ACK/NACK to " + container.getHeader().getSource().getIp().toString());
                 KHeader header = new BasicHeader(selfAdr, container.getHeader().getSource(), Transport.UDP);
@@ -226,16 +184,19 @@ public class LeaderSelectComp extends ComponentDefinition {
                 int nReqAcceptance = ( (int)Math.floor((double)tempGradSample.gradientNeighbours.size()/2) + 1 );
                 if(m_nNumOfACKsForLE >= nReqAcceptance) {
                     
-                    LOG.info(selfAdr.getIp().toString() + " got majority of acceptance. I am the leader now");
+                    LOG.info(selfAdr.getIp().toString() + " got majority of acceptance. I can be the leader now");
                     // Majority is reached and hence the node is the elected leader
                     m_addrLeader = selfAdr;
                     m_bLeader = m_bLeaderDisseminated = m_bIsLeaderAlive = true;
                     
-                    // Trigger the Leader dissemination to fingers
-                    // Other nodes shall get the leader from the finger nodes
-                    if(tempGradSample.gradientFingers.size() > 0) {
-                        Iterator<Container<KAddress, NewsView>> iter = tempGradSample.gradientFingers.iterator();
+                    // Set the leader
+                    updateLeader(selfAdr);
+                    
+                    // Update the immediate neighbours
+                    if(tempGradSample.gradientNeighbours.size() > 0) {
+                        Iterator<Container<KAddress, NewsView>> iter = tempGradSample.gradientNeighbours.iterator();
                         while(iter.hasNext()) {
+                            
                             KHeader header = new BasicHeader(selfAdr, iter.next().getSource(), Transport.UDP);
                             KContentMsg msg = new BasicContentMsg(header, new LeaderUpdate(selfAdr));
                             trigger(msg, networkPort);
@@ -246,35 +207,89 @@ public class LeaderSelectComp extends ComponentDefinition {
         }            
     };
         
+    private void updateLeader(KAddress addrLeader) {
+        
+        if( !m_addrLeader.getId().equals(addrLeader.getId()) ) {
+            
+            m_addrLeader = addrLeader;
+        }
+    }
+    
     // *************************************************************************
     //                      Leader Update Code
     // *************************************************************************
-    Handler handleLUTimeout = new Handler<LUpdateTimeout>() {
+    Handler handleLUTimeout = new Handler<LeaderUpdateTimeout>() {
         @Override
-        public void handle(LUpdateTimeout e) {
+        public void handle(LeaderUpdateTimeout e) {
             
-            if( !m_bLeader ) {
-                TGradientSample<NewsView> tmpView = gradSample;
-                if(tmpView != null) {
-                    if(tmpView.gradientFingers.size() > 0) {
-                        m_addrNewLeader = null;
-                        m_nCountFingerResponses = 0;
-                        m_nMinResponses = (int)Math.floor( (double)tmpView.gradientFingers.size()/2.0 ) + 1;
-
-                        Iterator<Container<KAddress, NewsView>> iter = tmpView.gradientFingers.iterator();
-                        while(iter.hasNext()) {
-                            
-                            // Request for the leader to the fingers
-                            KHeader header = new BasicHeader(selfAdr, iter.next().getSource(), Transport.UDP);
-                            KContentMsg msg = new BasicContentMsg(header, new GetLeaderRequest());
-                            trigger(msg, networkPort);
-                        }
-                    }
-                }
+            boolean bCan_I_BeLeader = checkIfICanBeLeader();
+            if(bCan_I_BeLeader == true) {
+                
+                LOG.info(selfAdr.getIp().toString() + ": have more utility value - gonna ask my neighbors");
+                tempGradSample = gradSample;
+                m_bLeaderDisseminated = false;
+                m_nNumOfACKsForLE = 0;
+                Iterator<Container<KAddress, NewsView>> iter2 = tempGradSample.gradientNeighbours.iterator();
+                while(iter2.hasNext()) {
+                    KAddress neighbor = iter2.next().getSource();
+                    KHeader header = new BasicHeader(selfAdr, neighbor, Transport.UDP);
+                    KContentMsg msg = new BasicContentMsg(header, new LeaderNomineeRequest(tempGradSample.selfView));
+                    trigger(msg, networkPort);
+                } 
+            } else {
+                
+                // Get the leader from the highest finger node because the 
+                // highest finger will be closer to the center of the network
+                Container<KAddress, NewsView> highestFingerNode = getNodeWithHighestNewsview(false);
+                KHeader header = new BasicHeader(selfAdr, highestFingerNode.getSource(), Transport.UDP);
+                KContentMsg msg = new BasicContentMsg(header, new GetLeaderRequest());
+                trigger(msg, networkPort);
             }
         }                
     };
 
+    private boolean checkIfICanBeLeader() {
+
+        boolean bReturnValue = false;
+
+        // Compare the highest valued neighbor with node's own view 
+        if(viewComparator.compare(gradSample.selfView, getNodeWithHighestNewsview(true)) > 0) {                    
+           bReturnValue = true;
+        }             
+        
+        return bReturnValue;
+    }
+    
+    private Container<KAddress, NewsView> getNodeWithHighestNewsview(boolean bgetHighestNeighbor) {
+     
+        tempGradSample = gradSample;
+        Container<KAddress, NewsView> node = null;
+        
+        if(bgetHighestNeighbor) {
+            // Return the neighbor with the highest news view
+            if(tempGradSample.gradientNeighbours.size() > 0) {
+                node = tempGradSample.getGradientNeighbours().get(0);
+                for(int nIndex = 1; nIndex < tempGradSample.getGradientNeighbours().size(); nIndex++) {
+                    if(viewComparator.compare(node.getContent(), tempGradSample.getGradientNeighbours().get(nIndex).getContent()) < 0) {
+                        node = tempGradSample.getGradientNeighbours().get(nIndex);
+                    }            
+                }
+            }
+        } else {
+            // Get highest Finger
+            if(tempGradSample.getGradientFingers().size() > 0) {
+                node = tempGradSample.getGradientFingers().get(0);
+                for(int nIndex = 1; nIndex < tempGradSample.getGradientFingers().size(); nIndex++) {
+                    if(viewComparator.compare(node.getContent(), tempGradSample.getGradientFingers().get(nIndex).getContent()) < 0) {
+                        node = tempGradSample.getGradientNeighbours().get(nIndex);
+                    }            
+                }
+            }
+        }
+        
+        return node;
+    }
+    
     ClassMatchedHandler handleGetLeaderReq = new 
         ClassMatchedHandler<GetLeaderRequest, KContentMsg<?, ?, GetLeaderRequest>>() {
             @Override
@@ -311,16 +326,16 @@ public class LeaderSelectComp extends ComponentDefinition {
     // *************************************************************************
     //                     Timers and Initialization classes
     // *************************************************************************
-    public static class LETimeout extends Timeout {
+    public static class stabilizationTimeout extends Timeout {
         
-        public LETimeout(SchedulePeriodicTimeout spt) {
+        public stabilizationTimeout(ScheduleTimeout spt) {
             super(spt);
         }
     }
     
-    public static class LUpdateTimeout extends Timeout {
+    public static class LeaderUpdateTimeout extends Timeout {
         
-        public LUpdateTimeout(SchedulePeriodicTimeout spt1) {
+        public LeaderUpdateTimeout(SchedulePeriodicTimeout spt1) {
             super(spt1);
         }
     }
