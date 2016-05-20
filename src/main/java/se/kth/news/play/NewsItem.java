@@ -18,7 +18,7 @@ public class NewsItem {
         this.strNews = news;
     }
     
-    public String getNewsItem() {
+    public String getNewsString() {
         
         return strNews;
     }

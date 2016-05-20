@@ -15,6 +15,7 @@ public class GetLeaderResponse implements KompicsEvent {
     public final KAddress m_addrLeader;
     
     public GetLeaderResponse(KAddress addrLeader) {
+        
         m_addrLeader = addrLeader;
     }
 }
