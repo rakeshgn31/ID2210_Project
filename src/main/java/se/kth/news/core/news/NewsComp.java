@@ -18,6 +18,7 @@
 package se.kth.news.core.news;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.UUID;
 import org.slf4j.Logger;
@@ -26,8 +27,6 @@ import se.kth.news.core.leader.LeadeUpdatePort;
 import se.kth.news.core.leader.LeaderUpdate;
 import se.kth.news.core.news.util.NewsView;
 import se.kth.news.play.NewsItem;
-import se.kth.news.play.Ping;
-import se.kth.news.play.Pong;
 import se.sics.kompics.ClassMatchedHandler;
 import se.sics.kompics.ComponentDefinition;
 import se.sics.kompics.Handler;
@@ -76,6 +75,7 @@ public class NewsComp extends ComponentDefinition {
     //*******************************EXTERNAL_STATE*****************************
     private KAddress m_selfAdr;
     private final Identifier m_gradientOId;
+    private Comparator viewComparator;
     
     //*******************************INTERNAL_STATE*****************************
     private UUID m_nNewsFloodTimeoutID;
@@ -87,7 +87,7 @@ public class NewsComp extends ComponentDefinition {
     // Task - 3.2 and above related
     // Leader is elected for the first time stop the news flooding
     private KAddress m_addrLeader;
-    private UUID m_nDissTimeoutID;
+    private UUID m_nDissTimeoutID, m_nNewsPullTimeoutID;
     private int m_nPeriodicNewsDissCtr;
     private String m_strPreviousDisseminatedNews;
     private TGradientSample<NewsView> m_gradSample;
@@ -103,6 +103,8 @@ public class NewsComp extends ComponentDefinition {
         LOG.info("{}initiating...", logPrefix);
 
         m_gradientOId = init.gradientOId;
+        viewComparator = init.viewComparator;
+        
         m_croupNeighborView = null;
         m_nNewsFloodSeqCounter = 0;
         m_arrReceivedNews = new ArrayList<>();
@@ -114,6 +116,10 @@ public class NewsComp extends ComponentDefinition {
         m_bPreviousNewsDisseminated = true; // when first news item for dissemination is 
         m_strPreviousDisseminatedNews = "";     // being generated it should be true 
         
+        m_nNewsFloodTimeoutID = null;
+        m_nDissTimeoutID = null;
+        m_nNewsPullTimeoutID = null;
+        
         subscribe(handleStart, control);
         subscribe(handleCroupierSample, croupierPort);
         subscribe(handleGradientSample, gradientPort);
@@ -124,9 +130,6 @@ public class NewsComp extends ComponentDefinition {
         subscribe(handleLeader, leaderPort);
         
         // Task - 3.2 and above related
-        
-        // subscribe(handlePing, networkPort);
-        // subscribe(handlePong, networkPort);
     }
 
     Handler handleStart = new Handler<Start>() {
@@ -148,15 +151,23 @@ public class NewsComp extends ComponentDefinition {
             sptPerdNewsDissemination.setTimeoutEvent(pndTO);
             trigger(sptPerdNewsDissemination, timerPort);
             m_nDissTimeoutID = pndTO.getTimeoutId();
+            
+            // Schedule a timeout for periodic news pull and synchronization
+            SchedulePeriodicTimeout sptPerdNewsPull = new SchedulePeriodicTimeout(30000, 15000);
+            PeriodicNewsSynchronizationTimeout pnsTO = new PeriodicNewsSynchronizationTimeout(sptPerdNewsPull);
+            sptPerdNewsPull.setTimeoutEvent(pnsTO);
+            trigger(sptPerdNewsPull, timerPort);
+            m_nNewsPullTimeoutID = pnsTO.getTimeoutId();
         }
     };
 
     @Override
     public void tearDown() {
-        if(m_nNewsFloodTimeoutID != null && m_nDissTimeoutID != null) {
+        if(m_nNewsFloodTimeoutID != null && m_nDissTimeoutID != null && m_nNewsPullTimeoutID != null) {
             
             trigger(new CancelPeriodicTimeout(m_nNewsFloodTimeoutID), timerPort);
             trigger(new CancelPeriodicTimeout(m_nDissTimeoutID), timerPort);
+            trigger(new CancelPeriodicTimeout(m_nNewsPullTimeoutID), timerPort);
         }
     }
     
@@ -207,7 +218,7 @@ public class NewsComp extends ComponentDefinition {
             if( !m_arrReceivedNews.contains(strNews) ) {
                 m_arrReceivedNews.add(strNews);
                 LOG.info(m_selfAdr.getIp().toString() + " received news item : " + strNews);
-                updateLocalNewsView(m_arrReceivedNews.size());    // Update regarding receiving new news item 
+                updateLocalNewsView(m_arrReceivedNews.size());    // Update local news view to the topology
                 nTTL--;
                 if(nTTL > 0) {
                     NewsItem news = new NewsItem(nTTL, strNews);
@@ -330,25 +341,6 @@ public class NewsComp extends ComponentDefinition {
                     m_bLeaderAlive = false;
                     trigger(new LeaderFailureUpdate(), leaderFailureUpdatePort);
                 }
-            } else {
-                // Other nodes shall pull the news periodically from the highest 
-                // finger as it will be close to the leader/ center of the network and
-                // will possibly have most of the latest news received
-                TGradientSample<NewsView> tmpGradSample = m_gradSample;
-                Container<KAddress, NewsView> node = null;
-                if(tmpGradSample.getGradientFingers().size() > 0) {
-                    node = tmpGradSample.getGradientFingers().get(0);
-                    for(int nIndex = 1; nIndex < tmpGradSample.getGradientFingers().size(); nIndex++) {
-                        if(viewComparator.compare(node.getContent(), tmpGradSample.getGradientFingers().get(nIndex).getContent()) < 0) {
-                            node = tmpGradSample.getGradientNeighbours().get(nIndex);
-                        }            
-                    }
-                }
-                
-                if(node != null) {
-                    // Pull the news from the highest finger node
-                    
-                }
             }
         }
     };
@@ -364,6 +356,7 @@ public class NewsComp extends ComponentDefinition {
             if( !m_arrReceivedNews.contains(news.getNewsString()) ) {
                 // Add it to its own view (Leader here)
                 m_arrReceivedNews.add(news.getNewsString());
+                updateLocalNewsView(m_arrReceivedNews.size());
                 
                 // Distribute only to its immediate neighbors so that the other nodes 
                 // will eventually get the news item if in case the leader dies
@@ -392,28 +385,64 @@ public class NewsComp extends ComponentDefinition {
             if( !m_arrReceivedNews.contains(m_strPreviousDisseminatedNews) ) {
                 
                 m_arrReceivedNews.add(m_strPreviousDisseminatedNews);
+                updateLocalNewsView(m_arrReceivedNews.size());
             }
         }            
     };
+
+    Handler handleNewsSynchronizationTimeout = new Handler<PeriodicNewsSynchronizationTimeout>() {
+        @Override
+        public void handle(PeriodicNewsSynchronizationTimeout e) {
             
-    ClassMatchedHandler handlePing
-            = new ClassMatchedHandler<Ping, KContentMsg<?, ?, Ping>>() {
-
-                @Override
-                public void handle(Ping content, KContentMsg<?, ?, Ping> container) {
-                    LOG.info("{}received ping from:{}", logPrefix, container.getHeader().getSource());
-                    trigger(container.answer(new Pong()), networkPort);
+            // Nodes shall pull the news periodically from the highest 
+            // finger as it will be close to the leader/ center of the network and
+            // will possibly have most of the latest news received
+            TGradientSample<NewsView> tmpGradSample = m_gradSample;
+            Container<KAddress, NewsView> node = null;
+            if(tmpGradSample.getGradientFingers().size() > 0) {
+                node = tmpGradSample.getGradientFingers().get(0);
+                for(int nIndex = 1; nIndex < tmpGradSample.getGradientFingers().size(); nIndex++) {
+                    if(viewComparator.compare(node.getContent(), tmpGradSample.getGradientFingers().get(nIndex).getContent()) < 0) {
+                        node = tmpGradSample.getGradientFingers().get(nIndex);
+                    }          
                 }
-            };
-
-    ClassMatchedHandler handlePong
-            = new ClassMatchedHandler<Pong, KContentMsg<?, KHeader<?>, Pong>>() {
-
-                @Override
-                public void handle(Pong content, KContentMsg<?, KHeader<?>, Pong> container) {
-                    LOG.info("{}received pong from:{}", logPrefix, container.getHeader().getSource());
+            }
+            
+            // Send a news pull request to the highest neighbourS
+            if(node != null) {
+                
+                KHeader header = new BasicHeader(m_selfAdr, node.getSource(), Transport.UDP);
+                KContentMsg msg = new BasicContentMsg(header, new NewsPullRequest());
+                trigger(msg, networkPort);
+            }            
+        }        
+    };
+    
+    ClassMatchedHandler handleNewsPullRequest 
+        = new ClassMatchedHandler<NewsPullRequest, KContentMsg<?, ?, NewsPullRequest>>() {
+        @Override
+        public void handle(NewsPullRequest req, KContentMsg<?, ?, NewsPullRequest> contentMsg) {
+            
+            KHeader header = new BasicHeader(m_selfAdr, contentMsg.getHeader().getSource(), Transport.UDP);
+            KContentMsg msg = new BasicContentMsg(header, new NewsPullResponse(m_arrReceivedNews));
+            trigger(msg, networkPort);
+        }            
+    };
+    
+    ClassMatchedHandler handleNewsPullResponse
+        = new ClassMatchedHandler<NewsPullResponse, KContentMsg<?, ?, NewsPullResponse>>() {
+        @Override
+        public void handle(NewsPullResponse resp, KContentMsg<?, ?, NewsPullResponse> contentMsg) {
+            
+            if(resp.arrNewsItems != null) {
+                if(resp.arrNewsItems.size() > 0) {
+                    
+                    // Sync the local news items list with the received news list
+                    m_arrReceivedNews.addAll(resp.arrNewsItems);
                 }
-            };
+            }
+        }       
+    };
     
     public static class PeriodicNewsDisseminationTimeout extends Timeout {
 
@@ -422,14 +451,23 @@ public class NewsComp extends ComponentDefinition {
         }
     }    
   
+    public static class PeriodicNewsSynchronizationTimeout extends Timeout {
+    
+        public PeriodicNewsSynchronizationTimeout(SchedulePeriodicTimeout spt) {
+            super(spt);
+        }
+    }
+    
     public static class Init extends se.sics.kompics.Init<NewsComp> {
 
         public final KAddress selfAdr;
         public final Identifier gradientOId;
+        public final Comparator viewComparator;
 
-        public Init(KAddress selfAdr, Identifier gradientOId) {
+        public Init(KAddress selfAdr, Identifier gradientOId, Comparator viewComp) {
             this.selfAdr = selfAdr;
             this.gradientOId = gradientOId;
+            this.viewComparator = viewComp;
         }
     }
 }

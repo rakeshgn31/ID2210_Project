@@ -22,6 +22,8 @@ import java.util.Iterator;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import se.kth.news.core.news.LeaderFailureUpdate;
+import se.kth.news.core.news.LeaderFailureUpdatePort;
 import se.kth.news.core.news.util.NewsView;
 import se.sics.kompics.ClassMatchedHandler;
 import se.sics.kompics.ComponentDefinition;
@@ -58,6 +60,7 @@ public class LeaderSelectComp extends ComponentDefinition {
     Positive<Network> networkPort = requires(Network.class);
     Positive<GradientPort> gradientPort = requires(GradientPort.class);
     Negative<LeadeUpdatePort> leaderUpdatePort = provides(LeadeUpdatePort.class);
+    Positive<LeaderFailureUpdatePort> leaderFailureUpdatePort = requires(LeaderFailureUpdatePort.class);
     //*******************************EXTERNAL_STATE*****************************
     
     //*******************************INTERNAL_STATE*****************************
@@ -166,10 +169,20 @@ public class LeaderSelectComp extends ComponentDefinition {
         }                
     };
 
+    // News component triggered leader failure event is handled here
+    Handler handleLeaderFailureUpdate = new Handler<LeaderFailureUpdate>() {
+        @Override
+        public void handle(LeaderFailureUpdate e) {
+            
+            m_addrLeader = null;
+            m_bLeader = m_bIsLeaderAlive = false;
+        }        
+    };
+    
     private void updateLeader(KAddress addrLeader) {
         
         m_addrLeader = addrLeader;
-        
+        m_bIsLeaderAlive = true;
         // Update the news component of the leader (first time) or the new leader
         trigger(new LeaderUpdate(m_addrLeader), leaderUpdatePort);
     }
@@ -300,6 +313,9 @@ public class LeaderSelectComp extends ComponentDefinition {
 
             // Compare to check if the leader has not changed
             if(resp.m_addrLeader != null) {
+                
+                // Because it got the leader response from others
+                m_bLeader = false;
                 updateLeader(resp.m_addrLeader);
             }
         }

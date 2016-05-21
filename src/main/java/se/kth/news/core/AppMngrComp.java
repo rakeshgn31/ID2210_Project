@@ -104,7 +104,7 @@ public class AppMngrComp extends ComponentDefinition {
     }
 
     private void connectNews() {
-        newsComp = create(NewsComp.class, new NewsComp.Init(selfAdr, gradientOId));
+        newsComp = create(NewsComp.class, new NewsComp.Init(selfAdr, gradientOId, new NewsViewComparator()));
         connect(newsComp.getNegative(Timer.class), extPorts.timerPort, Channel.TWO_WAY);
         connect(newsComp.getNegative(Network.class), extPorts.networkPort, Channel.TWO_WAY);
         connect(newsComp.getNegative(CroupierPort.class), extPorts.croupierPort, Channel.TWO_WAY);
