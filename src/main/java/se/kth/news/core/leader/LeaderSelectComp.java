@@ -374,7 +374,7 @@ public class LeaderSelectComp extends ComponentDefinition {
                 m_bLeader = m_bIsLeaderAlive = true;
                 m_bLeaderDisseminated = true;
                 
-                createLeaderNodeIDFile();
+                // createLeaderNodeIDFile();
                 LOG.info(selfAdr.getIp().toString() + " is the LEADER now..!!!");
                 
                 // Set the leader
