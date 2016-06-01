@@ -17,6 +17,15 @@
  */
 package se.kth.news.core.leader;
 
+import com.google.common.io.Files;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.UUID;
@@ -33,6 +42,7 @@ import se.sics.kompics.Positive;
 import se.sics.kompics.Start;
 import se.sics.kompics.network.Network;
 import se.sics.kompics.network.Transport;
+import se.sics.kompics.simulator.util.GlobalView;
 import se.sics.kompics.timer.CancelPeriodicTimeout;
 import se.sics.kompics.timer.SchedulePeriodicTimeout;
 import se.sics.kompics.timer.ScheduleTimeout;
@@ -67,11 +77,12 @@ public class LeaderSelectComp extends ComponentDefinition {
     private KAddress selfAdr;
     
     // Task 2 related variables
-    private KAddress m_addrLeader;    
-    private int m_nNumOfACKsForLE;
-    private TGradientSample<NewsView> tempGradSample;
+    private KAddress m_addrLeader, m_addrProbableLeader;    
+    private int m_nNumOfNomineeResp, m_nNumOfCommitResp; 
     private TGradientSample<NewsView> gradSample;
-    private Comparator viewComparator;    
+    private TGradientSample<NewsView> tempGradSample;
+    private Comparator viewComparator;
+    private int nReqNomineeResponses, nReqCommitResponses;
     
     // Task 3 related variables
     private UUID m_nLUTimeoutID;
@@ -83,19 +94,29 @@ public class LeaderSelectComp extends ComponentDefinition {
         logPrefix = "<nid:" + selfAdr.getId() + ">";
         LOG.info("{}initiating...", logPrefix);
         
-        gradSample = tempGradSample = null;
+        gradSample = null;
         viewComparator = init.viewComparator;
+        m_addrLeader = m_addrProbableLeader = null;
         m_bLeader = m_bLeaderDisseminated = m_bIsLeaderAlive = false;   
-
+        nReqNomineeResponses = nReqCommitResponses = 0;
+        
         subscribe(handleStart, control);
         subscribe(handleGradientSample, gradientPort);
         
+        // Task - 2 related events
+        subscribe(handleGradStabTimeout, timerPort);
         subscribe(handleLENomineeReq, networkPort);
         subscribe(handleLENominationResp, networkPort);
+        subscribe(handleLeaderCommitReq, networkPort);
+        subscribe(handleLeaderCommitResp, networkPort);
         
+        // Task - 3.1 related events
         subscribe(handleLUTimeout, timerPort);
         subscribe(handleGetLeaderReq, networkPort);
         subscribe(handleGetLeaderResp, networkPort);
+        
+        // Task - 4.1
+        subscribe(handleLeaderFailureUpdate, leaderFailureUpdatePort);
     }
 
     Handler handleStart = new Handler<Start>() {
@@ -104,17 +125,10 @@ public class LeaderSelectComp extends ComponentDefinition {
             LOG.info("{}starting...", logPrefix);
             
             // Schedule a timeout so that the topology shall stabilize by then
-            ScheduleTimeout spt = new ScheduleTimeout(70000);
-            stabilizationTimeout leTO = new stabilizationTimeout(spt);
-            spt.setTimeoutEvent(leTO);
-            trigger(spt, timerPort); 
-            
-            // Schedule a periodic timeout for either leader election or to poll for leader update
-            SchedulePeriodicTimeout spt1 = new SchedulePeriodicTimeout(30000, 2000);
-            LeaderUpdateTimeout luTO = new LeaderUpdateTimeout(spt1);
-            spt1.setTimeoutEvent(luTO);
-            trigger(spt1, timerPort);
-            m_nLUTimeoutID = luTO.getTimeoutId();
+            ScheduleTimeout spt = new ScheduleTimeout(210000);
+            GradientStabilizationTimeout gradStabTO = new GradientStabilizationTimeout(spt);
+            spt.setTimeoutEvent(gradStabTO);
+            trigger(spt, timerPort);
         }                      
     };
     
@@ -133,22 +147,35 @@ public class LeaderSelectComp extends ComponentDefinition {
         }
     };
 
+    Handler handleGradStabTimeout = new Handler<GradientStabilizationTimeout>() {
+        @Override
+        public void handle(GradientStabilizationTimeout e) {
+            
+            // Schedule a periodic timeout for either leader election or to poll for leader update
+            SchedulePeriodicTimeout spt1 = new SchedulePeriodicTimeout(2000, 30000);
+            UpdateLeaderTimeout luTO = new UpdateLeaderTimeout(spt1);
+            spt1.setTimeoutEvent(luTO);
+            trigger(spt1, timerPort);
+            m_nLUTimeoutID = luTO.getTimeoutId();
+        }        
+    };
+    
     // *************************************************************************
     //                      Leader Update Code
     // *************************************************************************
-    Handler handleLUTimeout = new Handler<LeaderUpdateTimeout>() {
+    Handler handleLUTimeout = new Handler<UpdateLeaderTimeout>() {
         @Override
-        public void handle(LeaderUpdateTimeout e) {
+        public void handle(UpdateLeaderTimeout e) {
             
             if(m_addrLeader == null && m_bIsLeaderAlive == false) {
                 
                 boolean bCan_I_BeLeader = checkIfICanBeLeader();
                 if(bCan_I_BeLeader == true) {
 
-                    LOG.info(selfAdr.getIp().toString() + ": have more utility value - gonna ask my neighbors");
                     tempGradSample = gradSample;
                     m_bLeaderDisseminated = false;
-                    m_nNumOfACKsForLE = 0;
+                    m_nNumOfNomineeResp = m_nNumOfCommitResp = 0;
+                    nReqNomineeResponses = tempGradSample.gradientNeighbours.size();
                     Iterator<Container<KAddress, NewsView>> iter2 = tempGradSample.gradientNeighbours.iterator();
                     while(iter2.hasNext()) {
                         KAddress neighbor = iter2.next().getSource();
@@ -161,9 +188,11 @@ public class LeaderSelectComp extends ComponentDefinition {
                     // Get the leader from the highest finger node because the 
                     // highest finger will be closer to the center of the network
                     Container<KAddress, NewsView> highestFingerNode = getNodeWithHighestNewsview(false);
-                    KHeader header = new BasicHeader(selfAdr, highestFingerNode.getSource(), Transport.UDP);
-                    KContentMsg msg = new BasicContentMsg(header, new GetLeaderRequest());
-                    trigger(msg, networkPort);
+                    if(highestFingerNode != null) {
+                        KHeader header = new BasicHeader(selfAdr, highestFingerNode.getSource(), Transport.UDP);
+                        KContentMsg msg = new BasicContentMsg(header, new GetLeaderRequest());
+                        trigger(msg, networkPort);
+                    }
                 }
             }
         }                
@@ -183,6 +212,8 @@ public class LeaderSelectComp extends ComponentDefinition {
         
         m_addrLeader = addrLeader;
         m_bIsLeaderAlive = true;
+        LOG.info(selfAdr.getIp().toString() + " setting " + m_addrLeader.getIp().toString() + " as leader.");
+
         // Update the news component of the leader (first time) or the new leader
         trigger(new LeaderUpdate(m_addrLeader), leaderUpdatePort);
     }
@@ -192,36 +223,44 @@ public class LeaderSelectComp extends ComponentDefinition {
         boolean bReturnValue = false;
 
         // Compare the highest valued neighbor with node's own view 
-        if(viewComparator.compare(gradSample.selfView, getNodeWithHighestNewsview(true)) > 0) {                    
-           bReturnValue = true;
-        }             
+        if(gradSample != null) {
+            if(viewComparator.compare(gradSample.selfView, getNodeWithHighestNewsview(true).getContent()) > 0) {                    
+               bReturnValue = true;
+            }
+        }
         
         return bReturnValue;
     }
     
     private Container<KAddress, NewsView> getNodeWithHighestNewsview(boolean bgetHighestNeighbor) {
      
-        tempGradSample = gradSample;
+        TGradientSample<NewsView> tempGradSample = gradSample;
         Container<KAddress, NewsView> node = null;
         
-        if(bgetHighestNeighbor) {
-            // Return the neighbor with the highest news view
-            if(tempGradSample.gradientNeighbours.size() > 0) {
-                node = tempGradSample.getGradientNeighbours().get(0);
-                for(int nIndex = 1; nIndex < tempGradSample.getGradientNeighbours().size(); nIndex++) {
-                    if(viewComparator.compare(node.getContent(), tempGradSample.getGradientNeighbours().get(nIndex).getContent()) < 0) {
-                        node = tempGradSample.getGradientNeighbours().get(nIndex);
-                    }            
+        if(tempGradSample != null) {
+            if(bgetHighestNeighbor) {
+                // Return the neighbor with the highest news view
+                if(tempGradSample.getGradientNeighbours() != null) {
+                    if(tempGradSample.gradientNeighbours.size() > 0) {
+                        node = tempGradSample.getGradientNeighbours().get(0);
+                        for(int nIndex = 1; nIndex < tempGradSample.getGradientNeighbours().size(); nIndex++) {
+                            if(viewComparator.compare(node.getContent(), tempGradSample.getGradientNeighbours().get(nIndex).getContent()) < 0) {
+                                node = tempGradSample.getGradientNeighbours().get(nIndex);
+                            }            
+                        }
+                    }
                 }
-            }
-        } else {
-            // Get highest Finger
-            if(tempGradSample.getGradientFingers().size() > 0) {
-                node = tempGradSample.getGradientFingers().get(0);
-                for(int nIndex = 1; nIndex < tempGradSample.getGradientFingers().size(); nIndex++) {
-                    if(viewComparator.compare(node.getContent(), tempGradSample.getGradientFingers().get(nIndex).getContent()) < 0) {
-                        node = tempGradSample.getGradientNeighbours().get(nIndex);
-                    }            
+            } else {
+                // Get highest Finger
+                if(tempGradSample.getGradientFingers() != null) {
+                    if(tempGradSample.getGradientFingers().size() > 0) {
+                        node = tempGradSample.getGradientFingers().get(0);
+                        for(int nIndex = 1; nIndex < tempGradSample.getGradientFingers().size(); nIndex++) {
+                            if(viewComparator.compare(node.getContent(), tempGradSample.getGradientFingers().get(nIndex).getContent()) < 0) {
+                                node = tempGradSample.getGradientFingers().get(nIndex);
+                            }            
+                        }
+                    }
                 }
             }
         }
@@ -229,8 +268,8 @@ public class LeaderSelectComp extends ComponentDefinition {
         return node;
     }
     
-        ClassMatchedHandler handleLENomineeReq = new 
-    ClassMatchedHandler<LeaderNomineeRequest, KContentMsg<?, ?, LeaderNomineeRequest>>() {
+    ClassMatchedHandler handleLENomineeReq = new 
+        ClassMatchedHandler<LeaderNomineeRequest, KContentMsg<?, ?, LeaderNomineeRequest>>() {
         @Override
         public void handle(LeaderNomineeRequest req, KContentMsg<?, ?, LeaderNomineeRequest> container) {
             if(gradSample != null) {
@@ -245,7 +284,10 @@ public class LeaderSelectComp extends ComponentDefinition {
                 }
               
                 // Finally send the acknowledgement
-                LOG.info(selfAdr.getIp().toString() + " sending ACK/NACK to " + container.getHeader().getSource().getIp().toString());
+                if(bSendACK == true) {
+                    
+                    m_addrProbableLeader = container.getHeader().getSource();
+                }
                 KHeader header = new BasicHeader(selfAdr, container.getHeader().getSource(), Transport.UDP);
                 KContentMsg msg = new BasicContentMsg(header, new LeaderNominationResponse(bSendACK));
                 trigger(msg, networkPort);
@@ -259,39 +301,108 @@ public class LeaderSelectComp extends ComponentDefinition {
         public void handle(LeaderNominationResponse resp, KContentMsg<?, ?, LeaderNominationResponse> container) {
             
             if(resp.bNodeAgreement) {
-                m_nNumOfACKsForLE++;
+                m_nNumOfNomineeResp++;
             }
-            
+
             // Temp Gradient Sample is already assigned during LE nominee 
             // request trigger. Checking it to be double safe
-            if(tempGradSample != null && m_bLeaderDisseminated == false) {
-                int nReqAcceptance = ( (int)Math.floor((double)tempGradSample.gradientNeighbours.size()/2) + 1 );
-                if(m_nNumOfACKsForLE >= nReqAcceptance) {
-                    
-                    LOG.info(selfAdr.getIp().toString() + " got majority of acceptance. I can be the leader now");
-                    // Majority is reached and hence the node is the elected leader
-                    m_addrLeader = selfAdr;
-                    m_bLeader = m_bIsLeaderAlive = true;
-                    
-                    // Set the leader
-                    updateLeader(selfAdr);
-                    
-                    // Update the immediate neighbours
-                    if(tempGradSample.gradientNeighbours.size() > 0) {
-                        Iterator<Container<KAddress, NewsView>> iter = tempGradSample.gradientNeighbours.iterator();
-                        while(iter.hasNext()) {
-                            
-                            KHeader header = new BasicHeader(selfAdr, iter.next().getSource(), Transport.UDP);
-                            KContentMsg msg = new BasicContentMsg(header, new LeaderUpdate(selfAdr));
-                            trigger(msg, networkPort);
-                        }
-                        
-                        m_bLeaderDisseminated = true;
-                    }
-                } 
-            }
+            // if(tempGradSample != null && m_bLeaderDisseminated == false) {
+            if(m_nNumOfNomineeResp == nReqNomineeResponses) {
+                sendCommitRequestsToNeighbors();                                        
+            } 
         }            
     };        
+    
+    private void sendCommitRequestsToNeighbors() {
+        
+        LOG.info(selfAdr.getIp().toString() + " sending commit requests to my neighbors to be elected as leader.");
+        
+        // Update the leader to immediate neighbours
+        if(tempGradSample.gradientNeighbours.size() > 0) {
+            nReqCommitResponses = tempGradSample.gradientNeighbours.size();
+            Iterator<Container<KAddress, NewsView>> iter = tempGradSample.gradientNeighbours.iterator();
+            while(iter.hasNext()) {
+
+                KAddress neighborAddr = iter.next().getSource();
+                KHeader header = new BasicHeader(selfAdr, neighborAddr, Transport.UDP);
+                KContentMsg msg = new BasicContentMsg(header, new LeaderCommitRequest());
+                LOG.info(selfAdr.getIp().toString() + " sending commit req to " + neighborAddr.getIp().toString());
+                trigger(msg, networkPort);
+            }
+        }
+    }
+    
+    ClassMatchedHandler handleLeaderCommitReq = new 
+            ClassMatchedHandler<LeaderCommitRequest, KContentMsg<?, ?, LeaderCommitRequest>>() {
+        @Override
+        public void handle(LeaderCommitRequest req, KContentMsg<?, ?, LeaderCommitRequest> msg) {
+            
+            // Check with the previous nominee request - probable leader
+            KHeader header = new BasicHeader(selfAdr, msg.getHeader().getSource(), Transport.UDP);
+            KContentMsg respMsg;
+            if(m_addrProbableLeader.getId().equals(msg.getHeader().getSource().getId())) {
+                
+                LOG.info(selfAdr.getIp().toString() + " resp to commit Req with ACK");
+                respMsg = new BasicContentMsg(header, new LeaderCommitResponse(true));
+
+                // As it matches, the requested node can be accepted as the leader
+                updateLeader(msg.getHeader().getSource());
+            } else {
+                
+                respMsg = new BasicContentMsg(header, new LeaderCommitResponse(false));
+            }
+            
+            // Trigger the response
+            trigger(respMsg, networkPort);
+        }          
+    };
+    
+    ClassMatchedHandler handleLeaderCommitResp = new 
+            ClassMatchedHandler<LeaderCommitResponse, KContentMsg<?, ?, LeaderCommitResponse>>() {
+        @Override
+        public void handle(LeaderCommitResponse resp, KContentMsg<?, ?, LeaderCommitResponse> msg) {
+            
+            if(resp.bNodeAgreement) {
+                m_nNumOfCommitResp++;
+            }
+            
+            if(m_nNumOfCommitResp == nReqCommitResponses) {
+
+                // All nodes have agreed and hence I am the leader now
+                // I shall inform my news view component of the update
+                m_addrLeader = selfAdr;
+                m_bLeader = m_bIsLeaderAlive = true;
+                m_bLeaderDisseminated = true;
+                
+                createLeaderNodeIDFile();
+                LOG.info(selfAdr.getIp().toString() + " is the LEADER now..!!!");
+                
+                // Set the leader
+                updateLeader(selfAdr);
+            }
+        }          
+    };
+    
+    // For leader kill simulation
+    private void createLeaderNodeIDFile() {
+        
+        try {
+                String leaderNodeId = selfAdr.getIp().toString().split("\\.")[3];
+
+                // if file exists, first delete it and then create it
+                File file = new File("E:\\leader.txt");
+                if (file.exists()) {
+                    file.delete();
+                }                
+                file.createNewFile();
+
+                FileWriter fw = new FileWriter(file.getAbsoluteFile());
+                BufferedWriter bw = new BufferedWriter(fw);
+                bw.write(leaderNodeId);
+                bw.close();
+                LOG.info("Created file with leader node ID for KILL simulation");
+        } catch (IOException e) {}
+    }
     
     ClassMatchedHandler handleGetLeaderReq = new 
         ClassMatchedHandler<GetLeaderRequest, KContentMsg<?, ?, GetLeaderRequest>>() {
@@ -299,6 +410,8 @@ public class LeaderSelectComp extends ComponentDefinition {
             public void handle(GetLeaderRequest req, KContentMsg<?, ?, GetLeaderRequest> content) {
                 if(m_addrLeader != null) {
                     
+                    LOG.info(selfAdr.getIp().toString() + " got a request for leader from " 
+                                            + content.getHeader().getSource().getIp().toString());
                     KHeader header = new BasicHeader(selfAdr, content.getHeader().getSource(), Transport.UDP);
                     KContentMsg msg = new BasicContentMsg(header, new GetLeaderResponse(m_addrLeader));
                     trigger(msg, networkPort);
@@ -324,16 +437,16 @@ public class LeaderSelectComp extends ComponentDefinition {
     // *************************************************************************
     //                     Timers and Initialization classes
     // *************************************************************************
-    public static class stabilizationTimeout extends Timeout {
+    public static class GradientStabilizationTimeout extends Timeout {
         
-        public stabilizationTimeout(ScheduleTimeout spt) {
+        public GradientStabilizationTimeout(ScheduleTimeout spt) {
             super(spt);
         }
     }
     
-    public static class LeaderUpdateTimeout extends Timeout {
+    public static class UpdateLeaderTimeout extends Timeout {
         
-        public LeaderUpdateTimeout(SchedulePeriodicTimeout spt1) {
+        public UpdateLeaderTimeout(SchedulePeriodicTimeout spt1) {
             super(spt1);
         }
     }

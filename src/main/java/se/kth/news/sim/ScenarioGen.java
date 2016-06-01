@@ -26,13 +26,13 @@ import se.sics.kompics.simulator.SimulationScenario;
 import se.sics.kompics.simulator.adaptor.Operation;
 import se.sics.kompics.simulator.adaptor.Operation1;
 import se.sics.kompics.simulator.adaptor.distributions.extra.BasicIntSequentialDistribution;
+import se.sics.kompics.simulator.events.system.KillNodeEvent;
 import se.sics.kompics.simulator.events.system.SetupEvent;
 import se.sics.kompics.simulator.events.system.StartNodeEvent;
 import se.sics.kompics.simulator.network.identifier.IdentifierExtractor;
 import se.sics.ktoolbox.omngr.bootstrap.BootstrapServerComp;
 import se.sics.ktoolbox.util.network.KAddress;
 import se.sics.ktoolbox.util.overlays.id.OverlayIdRegistry;
-
 /**
  * @author Alex Ormenisan <aaor@kth.se>
  */
@@ -54,7 +54,7 @@ public class ScenarioGen {
             };
         }
     };
-
+        
     static Operation<StartNodeEvent> startBootstrapServerOp = new Operation<StartNodeEvent>() {
 
         @Override
@@ -122,6 +122,28 @@ public class ScenarioGen {
         }
     };
 
+    static Operation1 killNode = new Operation1<KillNodeEvent, Integer>() {
+        @Override
+        public KillNodeEvent generate(final Integer nodeID) {
+            return new KillNodeEvent() {
+                    KAddress selfAdr;
+                    {
+                        selfAdr = ScenarioSetup.getNodeAdr(nodeID);
+                    }
+                    
+                    @Override
+                    public Address getNodeAddress() {
+                            return selfAdr;
+                    }
+
+                    @Override
+                    public String toString() {
+                            return "KillNode<" + selfAdr.toString() + ">";
+                    }
+            };
+        }
+    };
+    
     public static SimulationScenario simpleBoot() {
         SimulationScenario scen = new SimulationScenario() {
             {
@@ -140,14 +162,26 @@ public class ScenarioGen {
                 StochasticProcess startPeers = new StochasticProcess() {
                     {
                         eventInterArrivalTime(uniform(1000, 1100));
-                        raise(50, startNodeOp, new BasicIntSequentialDistribution(1));
+                        raise(100, startNodeOp, new BasicIntSequentialDistribution(1));
                     }
                 };
-
+                
+                // In my experiment, I have integrated News flooding before the 
+                // Leader election kicks in... Hence in each launch the leader
+                // changes - Leader is elected based on the highest view count dynamically
+                // rather than the highest node ID everytime.                
+                StochasticProcess killLeaderNode = new StochasticProcess() {
+                    {
+                        eventInterArrivalTime(uniform(1000, 1100));
+                        raise(1, killNode, new BasicIntSequentialDistribution(69));
+                    }
+                };
+                
                 systemSetup.start();
                 startBootstrapServer.startAfterTerminationOf(1000, systemSetup);
                 startPeers.startAfterTerminationOf(1000, startBootstrapServer);
-                terminateAfterTerminationOf(180000, startPeers);
+                // killLeaderNode.startAfterTerminationOf(600000, startPeers);
+                terminateAfterTerminationOf(600000, startPeers);
             }
         };
 

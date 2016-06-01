@@ -37,6 +37,7 @@ import se.sics.kompics.network.Network;
 import se.sics.kompics.network.Transport;
 import se.sics.kompics.timer.CancelPeriodicTimeout;
 import se.sics.kompics.timer.SchedulePeriodicTimeout;
+import se.sics.kompics.timer.ScheduleTimeout;
 import se.sics.kompics.timer.Timeout;
 import se.sics.kompics.timer.Timer;
 import se.sics.ktoolbox.croupier.CroupierPort;
@@ -66,7 +67,7 @@ public class NewsComp extends ComponentDefinition {
     Positive<Network> networkPort = requires(Network.class);
     Positive<CroupierPort> croupierPort = requires(CroupierPort.class);
     Positive<GradientPort> gradientPort = requires(GradientPort.class);
-    Positive<LeadeUpdatePort> leaderPort = requires(LeadeUpdatePort.class);
+    Positive<LeadeUpdatePort> leaderUpdatePort = requires(LeadeUpdatePort.class);
     Negative<OverlayViewUpdatePort> viewUpdatePort = provides(OverlayViewUpdatePort.class);
     
     // Update the Leader Selection component the failure of the leader to respond
@@ -125,11 +126,20 @@ public class NewsComp extends ComponentDefinition {
         subscribe(handleGradientSample, gradientPort);
         
         // Task - 1 related events
+        subscribe(handleCroupierStabTimeout, timerPort);
         subscribe(handleNewsItem, networkPort);
-        subscribe(handleNewsFloodTimeout, timerPort);
-        subscribe(handleLeader, leaderPort);
+        subscribe(handleNewsFloodTimeout, timerPort);        
         
-        // Task - 3.2 and above related
+        // Task 3.2
+        subscribe(handleLeader, leaderUpdatePort);
+        subscribe(handlePeriodicNewsDissemTimeout, timerPort);
+        subscribe(handleNewsDisseminationRequest, networkPort);
+        subscribe(handleNewsDisseminationResponse, networkPort);
+
+        // Task 4.2
+        subscribe(handleNewsSynchronizationTimeout, timerPort);
+        subscribe(handleNewsPullRequest, networkPort);
+        subscribe(handleNewsPullResponse, networkPort);
     }
 
     Handler handleStart = new Handler<Start>() {
@@ -138,26 +148,11 @@ public class NewsComp extends ComponentDefinition {
             LOG.info("{}starting...", logPrefix);
             updateLocalNewsView(0);
             
-            // Schedule a timeout for the news flood and initial topology stabilization
-            SchedulePeriodicTimeout sptNewsFlood = new SchedulePeriodicTimeout(60000, 5000);
-            NewsFloodTimeout floodTO = new NewsFloodTimeout(sptNewsFlood);
-            sptNewsFlood.setTimeoutEvent(floodTO);
-            trigger(sptNewsFlood, timerPort);
-            m_nNewsFloodTimeoutID = floodTO.getTimeoutId();
-            
-            // Schedule a timeout for the periodic news dissemination through the leader
-            SchedulePeriodicTimeout sptPerdNewsDissemination = new SchedulePeriodicTimeout(30000, 10000);
-            PeriodicNewsDisseminationTimeout pndTO = new PeriodicNewsDisseminationTimeout(sptPerdNewsDissemination);
-            sptPerdNewsDissemination.setTimeoutEvent(pndTO);
-            trigger(sptPerdNewsDissemination, timerPort);
-            m_nDissTimeoutID = pndTO.getTimeoutId();
-            
-            // Schedule a timeout for periodic news pull and synchronization
-            SchedulePeriodicTimeout sptPerdNewsPull = new SchedulePeriodicTimeout(30000, 15000);
-            PeriodicNewsSynchronizationTimeout pnsTO = new PeriodicNewsSynchronizationTimeout(sptPerdNewsPull);
-            sptPerdNewsPull.setTimeoutEvent(pnsTO);
-            trigger(sptPerdNewsPull, timerPort);
-            m_nNewsPullTimeoutID = pnsTO.getTimeoutId();
+            // Schedule a timeout so that the topology shall stabilize initially
+            ScheduleTimeout spt = new ScheduleTimeout(110000);
+            CroupierStabilizationTimeout croupStabTO = new CroupierStabilizationTimeout(spt);
+            spt.setTimeoutEvent(croupStabTO);
+            trigger(spt, timerPort);            
         }
     };
 
@@ -177,7 +172,7 @@ public class NewsComp extends ComponentDefinition {
     private void updateLocalNewsView(int nCount) {
         
         m_localNewsView = new NewsView(m_selfAdr.getId(), nCount);
-        LOG.debug("{}informing overlays of new view", logPrefix);
+        // LOG.debug("{}informing overlays of new view", logPrefix);
         trigger(new OverlayViewUpdate.Indication<>(m_gradientOId, false, m_localNewsView.copy()), viewUpdatePort);
     }
 
@@ -192,6 +187,33 @@ public class NewsComp extends ComponentDefinition {
         }
     };
 
+    Handler handleCroupierStabTimeout = new Handler<CroupierStabilizationTimeout>() {
+        @Override
+        public void handle(CroupierStabilizationTimeout e) {
+            
+            // Schedule a timeout for the news flood
+            SchedulePeriodicTimeout sptNewsFlood = new SchedulePeriodicTimeout(0, 40000);
+            NewsFloodTimeout floodTO = new NewsFloodTimeout(sptNewsFlood);
+            sptNewsFlood.setTimeoutEvent(floodTO);
+            trigger(sptNewsFlood, timerPort);
+            m_nNewsFloodTimeoutID = floodTO.getTimeoutId();
+            
+            // Schedule a timeout for the periodic news dissemination through the leader
+            SchedulePeriodicTimeout sptPerdNewsDissemination = new SchedulePeriodicTimeout(0, 60000);
+            PeriodicNewsDisseminationTimeout pndTO = new PeriodicNewsDisseminationTimeout(sptPerdNewsDissemination);
+            sptPerdNewsDissemination.setTimeoutEvent(pndTO);
+            trigger(sptPerdNewsDissemination, timerPort);
+            m_nDissTimeoutID = pndTO.getTimeoutId();
+            
+            // Schedule a timeout for periodic news pull and synchronization
+            SchedulePeriodicTimeout sptPerdNewsPull = new SchedulePeriodicTimeout(0, 80000);
+            PeriodicNewsSynchronizationTimeout pnsTO = new PeriodicNewsSynchronizationTimeout(sptPerdNewsPull);
+            sptPerdNewsPull.setTimeoutEvent(pnsTO);
+            trigger(sptPerdNewsPull, timerPort);
+            m_nNewsPullTimeoutID = pnsTO.getTimeoutId();
+        }        
+    };
+    
     Handler handleNewsFloodTimeout = new Handler<NewsFloodTimeout>() {
         @Override
         public void handle(NewsFloodTimeout event) {
@@ -200,7 +222,7 @@ public class NewsComp extends ComponentDefinition {
                 
                 // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
                 int nNodeID = Integer.parseInt( m_selfAdr.getIp().toString().split("\\.")[3] );
-                if(nNodeID % 15 == 0) {
+                if(nNodeID % 30 == 0) {
                     generateNews();                
                 }
             }
@@ -238,7 +260,7 @@ public class NewsComp extends ComponentDefinition {
                 m_nNewsFloodSeqCounter++;
                 String strNews = m_selfAdr.getIp().toString() + "_" + m_nNewsFloodSeqCounter 
                                                             + "_" + "Hai...I have the file";
-                NewsItem news = new NewsItem(5, strNews);
+                NewsItem news = new NewsItem(2, strNews);
                 m_arrReceivedNews.add(strNews);                   // Add news to its own received set                
                 
                 // Distribute to its neighbors
@@ -275,6 +297,13 @@ public class NewsComp extends ComponentDefinition {
         }          
     }
 
+    public static class CroupierStabilizationTimeout extends Timeout {
+        
+        public CroupierStabilizationTimeout(ScheduleTimeout spt) {
+            super(spt);
+        }
+    }
+        
     public static class NewsFloodTimeout extends Timeout {
 
         public NewsFloodTimeout(SchedulePeriodicTimeout spt) {
@@ -312,7 +341,7 @@ public class NewsComp extends ComponentDefinition {
 
             // Get node ID from the assigned IP address ( x.x.x.2 to x.x.x.2+NUM_OF_NODES)
             int nNodeID = Integer.parseInt( m_selfAdr.getIp().toString().split("\\.")[3] );
-            if(nNodeID % 10 == 0) {
+            if(nNodeID % 28 == 0) { // Just to limit the number of disseminations
 
                 // Check if the news previously generated and sent to the leader 
                 // was disseminated i.e., if the leader responded to the request (If Alive)
@@ -330,6 +359,8 @@ public class NewsComp extends ComponentDefinition {
                         // Send the news to the leader
                         KHeader header = new BasicHeader(m_selfAdr, m_addrLeader, Transport.UDP);
                         KContentMsg msg = new BasicContentMsg(header, new NewsDisseminationRequest(news));
+                        LOG.info(m_selfAdr.getIp().toString() + "Sending news dissemination "
+                                + "request to the leader " + m_addrLeader.getIp().toString());
                         trigger(msg, networkPort);
                     }
                 } else {
@@ -408,7 +439,7 @@ public class NewsComp extends ComponentDefinition {
                 }
             }
             
-            // Send a news pull request to the highest neighbourS
+            // Send a news pull request to the highest finger
             if(node != null) {
                 
                 KHeader header = new BasicHeader(m_selfAdr, node.getSource(), Transport.UDP);
@@ -425,8 +456,10 @@ public class NewsComp extends ComponentDefinition {
             
             KHeader header = new BasicHeader(m_selfAdr, contentMsg.getHeader().getSource(), Transport.UDP);
             KContentMsg msg = new BasicContentMsg(header, new NewsPullResponse(m_arrReceivedNews));
+            LOG.info(m_selfAdr.getIp().toString() + " received news pull request from " + 
+                                        contentMsg.getHeader().getSource().getIp().toString());
             trigger(msg, networkPort);
-        }            
+        }
     };
     
     ClassMatchedHandler handleNewsPullResponse
@@ -438,6 +471,8 @@ public class NewsComp extends ComponentDefinition {
                 if(resp.arrNewsItems.size() > 0) {
                     
                     // Sync the local news items list with the received news list
+                    LOG.info(m_selfAdr.getIp().toString() + " got news pull response from " + 
+                                            contentMsg.getHeader().getSource().getIp().toString());
                     m_arrReceivedNews.addAll(resp.arrNewsItems);
                 }
             }
